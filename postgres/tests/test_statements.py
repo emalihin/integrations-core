@@ -394,6 +394,7 @@ def test_statement_samples_collect(
         assert event['db']['query_truncated'] == expected_statement_truncated
 
         if expected_error_tag:
+            # TODO: i changed this and the test didnt fail?
             assert event['db']['plan']['definition'] is None, "did not expect to collect an execution plan"
             aggregator.assert_metric("dd.postgres.statement_samples.error", tags=tags + [expected_error_tag])
         else:

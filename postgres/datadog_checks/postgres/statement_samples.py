@@ -213,11 +213,13 @@ class PostgresStatementSamples(DBMAsyncJob):
         start_time = time.time()
         rows = self._get_new_pg_stat_activity()
         rows = self._filter_valid_statement_rows(rows)
-        events = self._explain_pg_stat_activity(rows)
+        event_samples, active_query_event = self._coll_explain_plan_and_active_queries(rows)
         submitted_count = 0
-        for e in events:
+        for e in event_samples:
             self._check.database_monitoring_query_sample(json.dumps(e, default=default_json_event_encoding))
             submitted_count += 1
+        self._log.warning(active_query_event)
+        # self._check.database_monitoring_query_sample(json.dumps(active_events, default=default_json_event_encoding))
         elapsed_ms = (time.time() - start_time) * 1000
         self._check.histogram("dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags)
         self._check.count(
@@ -233,6 +235,22 @@ class PostgresStatementSamples(DBMAsyncJob):
             len(self._explained_statements_ratelimiter),
             tags=self._tags,
         )
+
+    def _obfuscate_query(self, row):
+        try:
+            return datadog_agent.obfuscate_sql(row['query'], self._obfuscate_options)
+        except Exception as e:
+            self._log.debug("Failed to obfuscate statement: %s", e)
+            self._check.count(
+                "dd.postgres.statement_samples.error", 1,
+                tags=self._dbtags(row['datname'], "error:sql-obfuscate")
+            )
+
+    @staticmethod
+    def _collect_active_query(row, obfuscated_statement):
+        if row['state'] is not None and row['state'] == 'active':
+            row['query'] = obfuscated_statement
+            return dict(row)
 
     def _can_explain_statement(self, obfuscated_statement):
         if obfuscated_statement.startswith('SELECT {}'.format(self._explain_function)):
@@ -339,16 +357,7 @@ class PostgresStatementSamples(DBMAsyncJob):
             )
             return None, DBExplainError.database_error, '{}'.format(type(err))
 
-    def _collect_plan_for_statement(self, row):
-        try:
-            obfuscated_statement = datadog_agent.obfuscate_sql(row['query'], self._obfuscate_options)
-        except Exception as e:
-            self._log.debug("Failed to obfuscate statement: %s", e)
-            self._check.count(
-                "dd.postgres.statement_samples.error", 1, tags=self._dbtags(row['datname'], "error:sql-obfuscate")
-            )
-            return None
-
+    def _collect_plan_for_statement(self, row, obfuscated_statement):
         # limit the rate of explains done to the database
         query_signature = compute_sql_signature(obfuscated_statement)
         cache_key = (row['datname'], query_signature)
@@ -421,12 +430,20 @@ class PostgresStatementSamples(DBMAsyncJob):
                         event['timestamp'] = get_timestamp(row['state_change']) * 1000
             return event
 
-    def _explain_pg_stat_activity(self, rows):
+    def _coll_explain_plan_and_active_queries(self, rows):
+        active_query_rows = []
+        events = []
         for row in rows:
             try:
-                event = self._collect_plan_for_statement(row)
+                obfuscated_statement = self._obfuscate_query(row)
+                if not obfuscated_statement:
+                    continue
+                active_row = self._collect_active_query(row, obfuscated_statement)
+                if active_row:
+                    active_query_rows.append(json.dumps(active_row))
+                event = self._collect_plan_for_statement(row, obfuscated_statement)
                 if event:
-                    yield event
+                    events.append(event)
             except Exception:
                 self._log.exception(
                     "Crashed trying to collect execution plan for statement in dbname=%s", row['datname']
@@ -436,6 +453,16 @@ class PostgresStatementSamples(DBMAsyncJob):
                     1,
                     tags=self._tags + ["error:collect-plan-for-statement-crash"],
                 )
+        return events, self._create_active_query_event(active_query_rows)
+
+    def _create_active_query_event(self, active_query_rows):
+        event = {
+            "host": self._db_hostname,
+            "ddsource": "postgres",
+            "timestamp": time.time() * 1000,
+            "active_queries": active_query_rows
+        }
+        return event
 
     @staticmethod
     def _get_truncation_state(track_activity_query_size, statement):

@@ -213,7 +213,7 @@ class PostgresStatementSamples(DBMAsyncJob):
         start_time = time.time()
         rows = self._get_new_pg_stat_activity()
         rows = self._filter_valid_statement_rows(rows)
-        event_samples, active_query_event = self._coll_explain_plan_and_active_queries(rows)
+        event_samples, active_query_event = self._collect_activity_events(rows)
         submitted_count = 0
         for e in event_samples:
             self._check.database_monitoring_query_sample(json.dumps(e, default=default_json_event_encoding))
@@ -430,7 +430,7 @@ class PostgresStatementSamples(DBMAsyncJob):
                         event['timestamp'] = get_timestamp(row['state_change']) * 1000
             return event
 
-    def _coll_explain_plan_and_active_queries(self, rows):
+    def _collect_activity_events(self, rows):
         active_query_rows = []
         events = []
         for row in rows:
